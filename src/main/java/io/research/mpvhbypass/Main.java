@@ -62,7 +62,11 @@ public final class Main implements IXposedHookLoadPackage {
         installUiProbe();
         installExitGate();
         installSensorMuting(lpparam.classLoader);
-        if (kalam) { installDexSpy(lpparam.classLoader); installDexDump(lpparam.packageName); }
+        if (kalam) {
+            installDexSpy(lpparam.classLoader);
+            installDexDump(lpparam.packageName);
+            installClassLoaderProbe(lpparam.classLoader);
+        }
         if (mpar) installNativeScannerBypass(lpparam.classLoader);
 
         // Zepto binds its own classes late; re-apply once the real names arrive. This is
@@ -253,11 +257,97 @@ public final class Main implements IXposedHookLoadPackage {
         return null;
     }
 
+    // --- classloader integrity probe -------------------------------------------------
+    // com.liapp.i, .l and .v decrypt to pathList, dexElements,
+    // dexElementsSuppressedExceptions, makeDexElements, makePathElements, mPaths, mFiles,
+    // mZips, mDexs - three separate classes reading the app's own DexPathList. That is an
+    // integrity check on the class loader, and an Xposed framework necessarily adds to it.
+    // Dump what the app can see twice, before its payload lands and six seconds after, so
+    // the injected entry and the payload entry are both visible and distinguishable. This
+    // also settles why no dex dump appeared: either the InMemoryDexClassLoader constructor
+    // never ran, or it ran with an argument shape the previous build could silently miss.
+
+    private void installClassLoaderProbe(final ClassLoader loader) {
+        walkPathList("t0", loader);
+        try {
+            Class<?> handler = XposedHelpers.findClassIfExists("android.os.Handler", loader);
+            Class<?> looper = XposedHelpers.findClassIfExists("android.os.Looper", loader);
+            if (handler == null || looper == null) return;
+            Object mainLooper = XposedHelpers.callStaticMethod(looper, "getMainLooper");
+            Object h = XposedHelpers.newInstance(handler, mainLooper);
+            XposedHelpers.callMethod(h, "postDelayed",
+                    (Runnable) () -> walkPathList("t+6s", loader), 6000L);
+        } catch (Throwable t) {
+            report("no main-looper for the delayed walk: " + t);
+        }
+    }
+
+    private void walkPathList(String label, ClassLoader loader) {
+        Object pl;
+        try {
+            pl = XposedHelpers.getObjectField(loader, "pathList");
+        } catch (Throwable t) {
+            report(label + ": this loader has no pathList: " + t);
+            return;
+        }
+        if (pl == null) {
+            report(label + ": pathList is null");
+            return;
+        }
+        for (String field : new String[]{"mPaths", "mZips", "mFiles", "mDexs"}) {
+            Object arr = readField(pl, field);
+            if (arr == null || !arr.getClass().isArray()) continue;
+            for (int i = 0; i < Array.getLength(arr); i++) {
+                Object e = Array.get(arr, i);
+                if (e == null) continue;
+                String s = e instanceof File ? ((File) e).getAbsolutePath() : String.valueOf(e);
+                if (SEEN_EL.add(field + "=" + s)) report(label + " " + field + "[" + i + "] " + brief(s));
+            }
+        }
+        Object els = readField(pl, "dexElements");
+        if (els != null && els.getClass().isArray()) {
+            for (int i = 0; i < Array.getLength(els); i++) {
+                Object el = Array.get(els, i);
+                if (el == null) continue;
+                Object dexFile = readField(el, "dexFile");
+                String name = dexFile == null ? "no-dexfile" : dexName(dexFile);
+                if (SEEN_EL.add("element" + i + "=" + name)) {
+                    report(label + " dexElements[" + i + "] " + brief(name));
+                }
+            }
+        }
+    }
+
+    private static Object readField(Object target, String name) {
+        try {
+            return XposedHelpers.getObjectField(target, name);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // DexFile.getName has no static sibling: for an in-memory dex it is the only handle
+    // that distinguishes a real file path from LIAPP's anonymous payload.
+    private static String dexName(Object dexFile) {
+        try {
+            return String.valueOf(XposedHelpers.callMethod(dexFile, "getName"));
+        } catch (Throwable t) {
+            return "getName failed";
+        }
+    }
+
+    private static String brief(String s) {
+        return s.length() > 160 ? s.substring(0, 160) + "..." : s;
+    }
+
+    private static final java.util.Set<String> SEEN_EL =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     // --- TLS pinning ---------------------------------------------------------------
-    // No res/xml exists in this APK, so there is no network_security_config pin:
-    // pinning is entirely in-app (Zepto's Volley queue + custom trust managers).
-    // Swapping the TrustManager[] handed to SSLContext.init covers them all without
-    // depending on an obfuscated class name.
+    // mParivahan ships no res/xml, so it has no network_security_config pin: its pinning
+    // is entirely in-app (Zepto's Volley queue + custom trust managers). Kalam's is
+    // com.liapp.g, handled separately below. Swapping the TrustManager[] handed to
+    // SSLContext.init covers both without depending on an obfuscated class name.
 
     private static final X509TrustManager ACCEPT_ALL = new X509TrustManager() {
         @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
@@ -794,7 +884,7 @@ public final class Main implements IXposedHookLoadPackage {
     // observation volume is capped structurally rather than left to the hook's self
     // restraint. Once the cap is hit the hook still runs (behaviour stays patched), the
     // line just stops.
-    private static final int MAX_REPORTS = 40;
+    private static final int MAX_REPORTS = 60;
     private static int reports;
 
     private static void report(String msg) {
