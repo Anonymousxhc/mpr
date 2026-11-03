@@ -55,28 +55,22 @@ public final class Main implements IXposedHookLoadPackage {
 
         installPinningBypass(lpparam.classLoader);
         installRootBypass(lpparam.classLoader);
-        if (kalam) {
-            installKalamPinning(lpparam.classLoader);
-            installKalamDexSpy(lpparam.classLoader);
-        }
-        if (mpar) {
-            installDetectionBypass();
-            installUiProbe();
-            installNativeScannerBypass(lpparam.classLoader);
-        }
+        installDetectionBypass();
+        installUiProbe();
+        installExitGate();
+        if (kalam) installDexSpy(lpparam.classLoader);
+        if (mpar) installNativeScannerBypass(lpparam.classLoader);
 
-        // Zepto binds its own classes late; re-apply once the real names arrive.
+        // Zepto binds its own classes late; re-apply once the real names arrive. This is
+        // an mParivahan-only hook: it runs on every class load in the process, and Kalam
+        // needs no late binding (its okhttp3 classes resolve from the app loader at
+        // attach time), so there is no reason to pay that cost inside the packer.
+        if (!mpar) return;
         XposedHelpers.findAndHookMethod(ClassLoader.class, "loadClass", String.class,
                 new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam p) {
                 String name = (String) p.args[0];
                 if (name == null) return;
-                if (kalam) {
-                    if (name.startsWith("com.liapp.")) {
-                        hookLiappClass(name, lpparam.classLoader);
-                    }
-                    return;
-                }
                 if (name.equals(PIN_QUEUE) || name.equals(ROOTBEER)
                         || name.equals(NATIVE_SCANNER)
                         || name.equals(ROOTBEER_NATIVE) || contains(TRUST_MANAGERS, name)) {
@@ -93,44 +87,26 @@ public final class Main implements IXposedHookLoadPackage {
         return false;
     }
 
-    private static final java.util.Set<String> LIAPP_HOOKED =
+    private static final String OKHTTP_PINNER = "okhttp3.CertificatePinner";
+
+    // Classes this module has already neutralised in this process. Every install pass is
+    // re-entrant (late loadClass re-applies), so without this the same method accumulates
+    // duplicate callbacks and each one re-logs.
+    private static final java.util.Set<String> NEUTRALISED =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    private void installKalamPinning(ClassLoader loader) {
-        XC_MethodHook pass = new XC_MethodHook() {
-            @Override protected void beforeHookedMethod(MethodHookParam p) {
-                Class<?> rt = ((Method) p.method).getReturnType();
-                if (rt == void.class || rt == boolean.class) {
-                    p.setResult(rt == boolean.class ? Boolean.TRUE : null);
-                    return;
-                }
-                for (Object a : p.args) {           // list-returning variants: echo input
-                    if (a instanceof java.util.List) { p.setResult(a); return; }
-                }
-                p.setResult(null);
-            }
-        };
-        for (String cls : new String[]{"okhttp3.CertificatePinner",
-                "okhttp3.internal.tls.OkHostnameVerifier"}) {
-            Class<?> c = XposedHelpers.findClassIfExists(cls, loader);
-            if (c == null) continue;
-            XposedBridge.hookAllMethods(c, "check", pass);
-            XposedBridge.hookAllMethods(c, "verify", pass);
-            log("neutralised " + cls);
-        }
-    }
-
-    // Observe, do not stub: the protector's verdict path is unreadable statically, so
-    // log what com.liapp calls and returns until the real gate is identified.
-    private void installKalamDexSpy(ClassLoader loader) {
+    private void installDexSpy(ClassLoader loader) {
         Class<?> bdcl = XposedHelpers.findClassIfExists(
                 "dalvik.system.BaseDexClassLoader", null);
         if (bdcl != null) {
             XposedBridge.hookAllConstructors(bdcl, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
-                    if (p.args.length > 0 && p.args[0] != null) {
-                        XposedBridge.log(TAG + ": dex loaded from " + p.args[0]);
-                    }
+                    if (p.args.length == 0 || p.args[0] == null) return;
+                    String path = String.valueOf(p.args[0]);
+                    // "." is the boot classpath and shows up once per classloader; the
+                    // protector's own payload is what is worth a line.
+                    if (path.equals(".") || path.isEmpty()) return;
+                    if (SEEN_DEX.add(path)) report("dex loaded from " + path);
                 }
             });
         }
@@ -141,48 +117,33 @@ public final class Main implements IXposedHookLoadPackage {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     Object pi = p.getResult();
                     if (pi == null) return;
-                    try {
-                        Object sigs = XposedHelpers.getObjectField(pi, "signatures");
-                        int count = sigs == null ? 0 : java.lang.reflect.Array.getLength(sigs);
-                        XposedBridge.log(TAG + ": getPackageInfo(" + p.args[0]
-                                + ", flags=" + p.args[1] + ") signatures=" + count);
-                    } catch (Throwable ignored) { }
-                }
-            });
-        }
-    }
-
-    private void hookLiappClass(String name, ClassLoader loader) {
-        if (!LIAPP_HOOKED.add(name)) return;
-        final Class<?> c = XposedHelpers.findClassIfExists(name, loader);
-        if (c == null) return;
-        int n = 0;
-        for (Method m : c.getDeclaredMethods()) {
-            XposedBridge.hookAllMethods(c, m.getName(), new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) {
-                    StringBuilder sb = new StringBuilder();
+                    // Overloads differ in arity and in whether a PackageInfo is passed
+                    // through, so the flags are whichever last argument is numeric.
+                    long flags = 0;
+                    boolean numeric = false;
                     for (Object a : p.args) {
-                        sb.append('[').append(a == null ? "null"
-                                : clip(String.valueOf(a))).append(']');
+                        if (a instanceof Number) { flags = ((Number) a).longValue();
+                            numeric = true; }
                     }
-                    XposedBridge.log(TAG + ": liapp " + c.getName() + "."
-                            + p.method.getName() + "(" + sb + ")");
-                }
-
-                @Override protected void afterHookedMethod(MethodHookParam p) {
-                    if (p.getResult() == null) return;
-                    XposedBridge.log(TAG + ": liapp " + p.method.getName()
-                            + " => " + clip(String.valueOf(p.getResult())));
+                    // 0x40 GET_SIGNATURES, 0x08000000 GET_SIGNING_CERTIFICATES: the two
+                    // ways a protector asks "am I signed by the vendor".
+                    if (!numeric || (flags & (64L | 0x08000000L)) == 0) return;
+                    if (!SEEN_QUERY.add(p.args[0] + "/" + flags)) return;
+                    Object sigs = null;
+                    try { sigs = XposedHelpers.getObjectField(pi, "signatures"); }
+                    catch (Throwable ignored) { }
+                    report("signature self-check: getPackageInfo(" + p.args[0]
+                            + ", flags=0x" + Long.toHexString(flags) + ") signatures="
+                            + (sigs == null ? 0 : Array.getLength(sigs)));
                 }
             });
-            n++;
         }
-        XposedBridge.log(TAG + ": observing " + n + " methods of " + name);
     }
 
-    private static String clip(String s) {
-        return s.length() > 140 ? s.substring(0, 140) + "..." : s;
-    }
+    private static final java.util.Set<String> SEEN_DEX =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static final java.util.Set<String> SEEN_QUERY =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // --- TLS pinning ---------------------------------------------------------------
     // No res/xml exists in this APK, so there is no network_security_config pin:
@@ -212,11 +173,20 @@ public final class Main implements IXposedHookLoadPackage {
                     }
         }, X509Certificate[].class, String.class, String.class);
 
-        // Absent in 2.0.144; harmless coverage if a later build adds OkHttp.
-        hook("okhttp3.CertificatePinner", loader, "check",
-                bypass(), String.class, List.class);
-        hook("okhttp3.CertificatePinner", loader, "check",
-                bypass(), String.class, X509Certificate[].class);
+        // OkHttp pins after the handshake, so SSLContext alone is not enough. Named
+        // overloads are gone: the signature set changes across OkHttp 3/4/5, so hook
+        // every check/verify that exists instead of guessing which one is present.
+        Class<?> pinner = XposedHelpers.findClassIfExists(OKHTTP_PINNER, loader);
+        if (pinner != null && NEUTRALISED.add(OKHTTP_PINNER)) {
+            XposedBridge.hookAllMethods(pinner, "check", passThrough());
+            log("neutralised " + OKHTTP_PINNER);
+        }
+        Class<?> hostVer = XposedHelpers.findClassIfExists(
+                "okhttp3.internal.tls.OkHostnameVerifier", loader);
+        if (hostVer != null && NEUTRALISED.add(hostVer.getName())) {
+            XposedBridge.hookAllMethods(hostVer, "verify", passThrough());
+            log("neutralised OkHttp hostname verifier");
+        }
 
         final HostnameVerifier allowHost = new HostnameVerifier() {
             @Override public boolean verify(String h, SSLSession s) { return true; }
@@ -437,11 +407,37 @@ public final class Main implements IXposedHookLoadPackage {
         hook(sys("android.widget.TextView"), "setText", textSpy, CharSequence.class);
         hook(sys("android.widget.Toast"), "makeText", spy(1),
                 sys("android.content.Context"), CharSequence.class, int.class);
-        hook(sys("java.lang.Runtime"), "exit", new XC_MethodHook() {
+    }
+
+    // --- suicide gate ---------------------------------------------------------------
+    // mParivahan answers its scanner verdict with System.exit(0) from
+    // com.zepto.A90.onClick, and a packed app usually does the same from its protector,
+    // so the app dies before any request can be captured. Holding the process open is
+    // the only way to reach the network layer; the caller stack is logged because it is
+    // what names the gate.
+
+    private void installExitGate() {
+        XC_MethodHook hold = new XC_MethodHook() {
             @Override protected void beforeHookedMethod(MethodHookParam p) {
-                XposedBridge.log(TAG + ": exit(" + p.args[0] + ") stack=" + stackString());
+                report("blocked exit(" + p.args[0] + ")" + stackString());
+                p.setResult(null);
             }
-        }, int.class);
+        };
+        hook(sys("java.lang.System"), "exit", hold, int.class);
+        hook(sys("java.lang.Runtime"), "exit", hold, int.class);
+        hook(sys("java.lang.Runtime"), "halt", hold, int.class);
+
+        Class<?> proc = sys("android.os.Process");
+        if (proc != null) {
+            hook(proc, "killProcess", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    // Only our own pid: a legit :subprocess teardown must still work.
+                    if (!Integer.valueOf(android.os.Process.myPid()).equals(p.args[0])) return;
+                    report("blocked killProcess(" + p.args[0] + ")" + stackString());
+                    p.setResult(null);
+                }
+            }, int.class);
+        }
     }
 
     private XC_MethodHook spy(final int index) {
@@ -452,16 +448,24 @@ public final class Main implements IXposedHookLoadPackage {
                 if (text.isEmpty() || text.length() > 400) return;
                 String lower = text.toLowerCase();
                 for (String kw : UI_KEYWORDS) {
-                    if (lower.contains(kw)) {
-                        XposedBridge.log(TAG + ": warned \"" + text + "\" via "
+                    if (!lower.contains(kw)) continue;
+                    // A list adapter can rebind the same warning every frame; the first
+                    // hit is the one that carries the caller stack.
+                    if (SEEN_TEXT.add(text)) {
+                        report("warned \"" + text + "\" via "
                                 + p.method.getDeclaringClass().getName() + "."
-                                + p.method.getName() + " stack=" + stackString());
-                        return;
+                                + p.method.getName() + stackString());
                     }
+                    return;
                 }
             }
         };
     }
+
+    private static final java.util.Set<String> SEEN_TEXT =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static final java.util.Set<String> SEEN_NATIVE =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private static String stackString() {
         StringBuilder sb = new StringBuilder();
@@ -510,6 +514,8 @@ public final class Main implements IXposedHookLoadPackage {
             log(NATIVE_SCANNER + " not resolvable via app loader");
             return;
         }
+        // 158 methods; re-hooking them on every late loadClass hit would stack callbacks.
+        if (!NEUTRALISED.add(NATIVE_SCANNER)) return;
         XC_MethodHook hook = new XC_MethodHook() {
             @Override protected void beforeHookedMethod(MethodHookParam p) {
                 String name = p.method.getName();
@@ -527,8 +533,8 @@ public final class Main implements IXposedHookLoadPackage {
                 String name = p.method.getName();
                 if (!WATCH.contains(name) || p.getResult() == null) return;
                 String v = String.valueOf(p.getResult());
-                XposedBridge.log(TAG + ": native " + name + "() = "
-                        + (v.length() > 180 ? v.substring(0, 180) + "..." : v));
+                if (v.length() > 180) v = v.substring(0, 180) + "...";
+                if (SEEN_NATIVE.add(name + "=" + v)) report("native " + name + "() = " + v);
             }
         };
         int n = 0;
@@ -558,6 +564,36 @@ public final class Main implements IXposedHookLoadPackage {
         };
     }
 
+    // Skip a validator without corrupting callers that use its return value: decide the
+    // substitute from the declared return type, since OkHttp's check() overloads return
+    // the peer chain in 4.x and void in 3.x.
+    private static XC_MethodHook passThrough() {
+        return new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                Class<?> rt = ((Method) p.method).getReturnType();
+                if (rt == boolean.class || rt == Boolean.class) {
+                    p.setResult(Boolean.TRUE);
+                    return;
+                }
+                if (java.util.Collection.class.isAssignableFrom(rt)) {
+                    for (Object a : p.args) if (a instanceof java.util.Collection) {
+                        p.setResult(a);
+                        return;
+                    }
+                    p.setResult(java.util.Collections.emptyList());
+                    return;
+                }
+                if (rt.isArray()) {
+                    for (Object a : p.args) {
+                        if (a != null && a.getClass().isArray()) { p.setResult(a); return; }
+                    }
+                    return;
+                }
+                p.setResult(null);
+            }
+        };
+    }
+
     private static void hook(Class<?> cls, String method, XC_MethodHook cb, Class<?>... params) {
         if (cls == null) return;
         try {
@@ -578,5 +614,20 @@ public final class Main implements IXposedHookLoadPackage {
 
     private static void log(String msg) {
         XposedBridge.log(TAG + ": " + msg);
+    }
+
+    // Per-call observations. logcat drops a process over its quota, and a dropped or
+    // stalled writer is what stopped the packed target from ever finishing launch, so
+    // observation volume is capped structurally rather than left to the hook's self
+    // restraint. Once the cap is hit the hook still runs (behaviour stays patched), the
+    // line just stops.
+    private static final int MAX_REPORTS = 40;
+    private static int reports;
+
+    private static void report(String msg) {
+        if (reports >= MAX_REPORTS) return;
+        reports++;
+        if (reports == MAX_REPORTS) log("observation cap reached, later hits suppressed");
+        log(msg);
     }
 }
