@@ -155,7 +155,7 @@ public final class Main implements IXposedHookLoadPackage {
         Class<?> beerNative = XposedHelpers.findClassIfExists(ROOTBEER_NATIVE, loader);
         if (beerNative != null) {
             hook(beerNative, "checkForRoot", new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam p) {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
                     p.setResult(0);
                 }
             }, Object[].class);
@@ -172,7 +172,9 @@ public final class Main implements IXposedHookLoadPackage {
         Class<?> beer = XposedHelpers.findClassIfExists(ROOTBEER, loader);
         if (beer != null) {
             XC_MethodHook falseResult = new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam p) {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    // before, not after: the original body still probes su paths,
+                    // spawns getprop/mount and logs "binary detected!" if allowed to run.
                     p.setResult(Boolean.FALSE);
                 }
             };
@@ -181,6 +183,17 @@ public final class Main implements IXposedHookLoadPackage {
                 if (m.getReturnType() != boolean.class) continue;
                 XposedBridge.hookAllMethods(beer, m.getName(), falseResult);
                 hooked++;
+            }
+            // Starve the checkers: empty the su-path and dangerous-prop candidate lists.
+            XC_MethodHook emptyArray = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    p.setResult(new String[0]);
+                }
+            };
+            for (String name : new String[]{"t", "u"}) {
+                try {
+                    XposedHelpers.findAndHookMethod(beer, name, emptyArray);
+                } catch (Throwable ignored) { }
             }
             log("false-baked " + hooked + " root predicates in " + ROOTBEER);
         }
