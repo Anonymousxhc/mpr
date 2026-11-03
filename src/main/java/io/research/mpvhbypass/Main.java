@@ -53,6 +53,8 @@ public final class Main implements IXposedHookLoadPackage {
         installPinningBypass(lpparam.classLoader);
         installRootBypass(lpparam.classLoader);
         installDetectionBypass();
+        installUiProbe();
+        installNativeScannerBypass(lpparam.classLoader);
 
         // Zepto binds its own classes late; re-apply once the real names arrive.
         XposedHelpers.findAndHookMethod(ClassLoader.class, "loadClass", String.class,
@@ -61,9 +63,11 @@ public final class Main implements IXposedHookLoadPackage {
                 String name = (String) p.args[0];
                 if (name == null) return;
                 if (name.equals(PIN_QUEUE) || name.equals(ROOTBEER)
+                        || name.equals(NATIVE_SCANNER)
                         || name.equals(ROOTBEER_NATIVE) || contains(TRUST_MANAGERS, name)) {
                     installPinningBypass(lpparam.classLoader);
                     installRootBypass(lpparam.classLoader);
+                    installNativeScannerBypass(lpparam.classLoader);
                 }
             }
         });
@@ -100,7 +104,7 @@ public final class Main implements IXposedHookLoadPackage {
                     @Override protected void afterHookedMethod(MethodHookParam p) {
                         p.setResult(p.args[0]);
                     }
-                }, String.class, String.class, List.class);
+        }, X509Certificate[].class, String.class, String.class);
 
         // Absent in 2.0.144; harmless coverage if a later build adds OkHttp.
         hook("okhttp3.CertificatePinner", loader, "check",
@@ -311,6 +315,126 @@ public final class Main implements IXposedHookLoadPackage {
         });
     }
 
+    // --- attribution probe -------------------------------------------------------
+    // Every RootBeer predicate already returns false in the app's own log lines, and
+    // "binary detected" exists in exactly one class (a51.b) whose body we now skip, so
+    // the emitter of the visible warning is unidentified. Capture it instead of guessing.
+
+    private static final String[] UI_KEYWORDS = {
+        "binary", "root", "emulator", "detect", "tamper", "unauthor",
+        "integrity", "not supported", "unsafe", "jailbreak", "hook"
+    };
+
+    private void installUiProbe() {
+        XC_MethodHook textSpy = spy(0);
+        hook(sys("android.app.AlertDialog$Builder"), "setMessage", textSpy, CharSequence.class);
+        hook(sys("android.widget.TextView"), "setText", textSpy, CharSequence.class);
+        hook(sys("android.widget.Toast"), "makeText", spy(1),
+                sys("android.content.Context"), CharSequence.class, int.class);
+        hook(sys("java.lang.Runtime"), "exit", new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                XposedBridge.log(TAG + ": exit(" + p.args[0] + ") stack=" + stackString());
+            }
+        }, int.class);
+    }
+
+    private XC_MethodHook spy(final int index) {
+        return new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                if (p.args == null || index >= p.args.length || p.args[index] == null) return;
+                String text = String.valueOf(p.args[index]);
+                if (text.isEmpty() || text.length() > 400) return;
+                String lower = text.toLowerCase();
+                for (String kw : UI_KEYWORDS) {
+                    if (lower.contains(kw)) {
+                        XposedBridge.log(TAG + ": warned \"" + text + "\" via "
+                                + p.method.getDeclaringClass().getName() + "."
+                                + p.method.getName() + " stack=" + stackString());
+                        return;
+                    }
+                }
+            }
+        };
+    }
+
+    private static String stackString() {
+        StringBuilder sb = new StringBuilder();
+        int shown = 0;
+        for (StackTraceElement e : new Throwable().getStackTrace()) {
+            String c = e.getClassName();
+            if (c.startsWith("io.research.mpvhbypass") || c.startsWith("de.robv")) continue;
+            sb.append("\n    at ").append(c).append('.').append(e.getMethodName())
+              .append(':').append(e.getLineNumber());
+            if (++shown >= 12) break;
+        }
+        return sb.toString();
+    }
+
+    private static Class<?> sys(String name) {
+        try {
+            return Class.forName(name);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // --- AppProtect native scanner ----------------------------------------------
+    // klo.yui.bnm.NativeInteractor declares 158 native methods; the detection ones are
+    // reachable through Kotlin lazy caches (cachedbinarySu -> getBSu, etc). doCToast is
+    // native code raising the warning itself, which is why blinding RootBeer changed
+    // nothing. Key/credential natives (AESKey, fK, fIV, getRSAPub/Pvt, cliid, chnild)
+    // are deliberately untouched: nulling them breaks API auth instead of hiding root.
+
+    private static final String NATIVE_SCANNER = "klo.yui.bnm.NativeInteractor";
+    private static final java.util.Set<String> SUPPRESS = new java.util.HashSet<>(
+            java.util.Arrays.asList("getBSu", "getBB", "getEmuUsb", "kittyhook",
+                    "str1001", "scanWithContext", "BPTA", "RDG", "sCTiChek", "jitCC",
+                    "doCToast", "doCL"));
+    // Not stubbed: they may feed device binding. Logged once each so the real gate
+    // can be identified from the values rather than guessed at.
+    private static final java.util.Set<String> WATCH = new java.util.HashSet<>(
+            java.util.Arrays.asList("namek", "namek2", "mod", "minf", "mfd", "ptd",
+                    "hdd", "getPath", "spath1", "spathend", "spd", "enls", "strF1",
+                    "the1", "the2", "getConfig", "getAI007", "analyticsState",
+                    "NAFTD", "PED"));
+
+    private void installNativeScannerBypass(ClassLoader loader) {
+        Class<?> ni = XposedHelpers.findClassIfExists(NATIVE_SCANNER, loader);
+        if (ni == null) {
+            log(NATIVE_SCANNER + " not resolvable via app loader");
+            return;
+        }
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                String name = p.method.getName();
+                if (!SUPPRESS.contains(name)) return;
+                Class<?> rt = ((java.lang.reflect.Method) p.method).getReturnType();
+                if (rt == boolean.class) p.setResult(Boolean.FALSE);
+                else if (rt == int.class) p.setResult(0);
+                else if (rt == long.class) p.setResult(0L);
+                else if (rt == String.class) p.setResult("");
+                else if (rt == void.class) p.setResult(null);
+                else p.setResult(null);
+            }
+
+            @Override protected void afterHookedMethod(MethodHookParam p) {
+                String name = p.method.getName();
+                if (!WATCH.contains(name) || p.getResult() == null) return;
+                String v = String.valueOf(p.getResult());
+                XposedBridge.log(TAG + ": native " + name + "() = "
+                        + (v.length() > 180 ? v.substring(0, 180) + "..." : v));
+            }
+        };
+        int n = 0;
+        for (Method m : ni.getDeclaredMethods()) {
+            if (SUPPRESS.contains(m.getName()) || WATCH.contains(m.getName())) {
+                XposedBridge.hookAllMethods(ni, m.getName(), hook);
+                n++;
+            }
+        }
+        log("hooked " + n + " AppProtect native scanner methods");
+    }
+
     private static String join(String[] parts) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < parts.length; i++) {
@@ -329,6 +453,7 @@ public final class Main implements IXposedHookLoadPackage {
     }
 
     private static void hook(Class<?> cls, String method, XC_MethodHook cb, Class<?>... params) {
+        if (cls == null) return;
         try {
             Object[] args = new Object[params.length + 1];
             System.arraycopy(params, 0, args, 0, params.length);
