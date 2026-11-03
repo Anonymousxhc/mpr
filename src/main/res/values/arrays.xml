@@ -2,5 +2,6 @@
 <resources>
     <string-array name="xposed_scope">
         <item>com.nic.mparivahan</item>
+        <item>com.kalam</item>
     </string-array>
 </resources>

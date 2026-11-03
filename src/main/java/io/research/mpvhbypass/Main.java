@@ -22,6 +22,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 public final class Main implements IXposedHookLoadPackage {
 
     private static final String TARGET = "com.nic.mparivahan";
+    private static final String TARGET_KALAM = "com.kalam";
     private static final String TAG = "mpvh-bypass";
 
     // Anchored to NextGen mParivahan 2.0.144 / versionCode 304 (sha256 198d7337...b169).
@@ -47,14 +48,22 @@ public final class Main implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
-        if (!TARGET.equals(lpparam.packageName)) return;
+        final boolean mpar = TARGET.equals(lpparam.packageName);
+        final boolean kalam = TARGET_KALAM.equals(lpparam.packageName);
+        if (!mpar && !kalam) return;
         log("attached to " + lpparam.packageName);
 
         installPinningBypass(lpparam.classLoader);
         installRootBypass(lpparam.classLoader);
-        installDetectionBypass();
-        installUiProbe();
-        installNativeScannerBypass(lpparam.classLoader);
+        if (kalam) {
+            installKalamPinning(lpparam.classLoader);
+            installKalamDexSpy(lpparam.classLoader);
+        }
+        if (mpar) {
+            installDetectionBypass();
+            installUiProbe();
+            installNativeScannerBypass(lpparam.classLoader);
+        }
 
         // Zepto binds its own classes late; re-apply once the real names arrive.
         XposedHelpers.findAndHookMethod(ClassLoader.class, "loadClass", String.class,
@@ -62,6 +71,12 @@ public final class Main implements IXposedHookLoadPackage {
             @Override protected void afterHookedMethod(MethodHookParam p) {
                 String name = (String) p.args[0];
                 if (name == null) return;
+                if (kalam) {
+                    if (name.startsWith("com.liapp.")) {
+                        hookLiappClass(name, lpparam.classLoader);
+                    }
+                    return;
+                }
                 if (name.equals(PIN_QUEUE) || name.equals(ROOTBEER)
                         || name.equals(NATIVE_SCANNER)
                         || name.equals(ROOTBEER_NATIVE) || contains(TRUST_MANAGERS, name)) {
@@ -76,6 +91,97 @@ public final class Main implements IXposedHookLoadPackage {
     private static boolean contains(String[] set, String value) {
         for (String s : set) if (s.equals(value)) return true;
         return false;
+    }
+
+    private static final java.util.Set<String> LIAPP_HOOKED =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private void installKalamPinning(ClassLoader loader) {
+        XC_MethodHook pass = new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                Class<?> rt = ((Method) p.method).getReturnType();
+                if (rt == void.class || rt == boolean.class) {
+                    p.setResult(rt == boolean.class ? Boolean.TRUE : null);
+                    return;
+                }
+                for (Object a : p.args) {           // list-returning variants: echo input
+                    if (a instanceof java.util.List) { p.setResult(a); return; }
+                }
+                p.setResult(null);
+            }
+        };
+        for (String cls : new String[]{"okhttp3.CertificatePinner",
+                "okhttp3.internal.tls.OkHostnameVerifier"}) {
+            Class<?> c = XposedHelpers.findClassIfExists(cls, loader);
+            if (c == null) continue;
+            XposedBridge.hookAllMethods(c, "check", pass);
+            XposedBridge.hookAllMethods(c, "verify", pass);
+            log("neutralised " + cls);
+        }
+    }
+
+    // Observe, do not stub: the protector's verdict path is unreadable statically, so
+    // log what com.liapp calls and returns until the real gate is identified.
+    private void installKalamDexSpy(ClassLoader loader) {
+        Class<?> bdcl = XposedHelpers.findClassIfExists(
+                "dalvik.system.BaseDexClassLoader", null);
+        if (bdcl != null) {
+            XposedBridge.hookAllConstructors(bdcl, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (p.args.length > 0 && p.args[0] != null) {
+                        XposedBridge.log(TAG + ": dex loaded from " + p.args[0]);
+                    }
+                }
+            });
+        }
+        Class<?> apm = XposedHelpers.findClassIfExists(
+                "android.app.ApplicationPackageManager", null);
+        if (apm != null) {
+            XposedBridge.hookAllMethods(apm, "getPackageInfo", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    Object pi = p.getResult();
+                    if (pi == null) return;
+                    try {
+                        Object sigs = XposedHelpers.getObjectField(pi, "signatures");
+                        int count = sigs == null ? 0 : java.lang.reflect.Array.getLength(sigs);
+                        XposedBridge.log(TAG + ": getPackageInfo(" + p.args[0]
+                                + ", flags=" + p.args[1] + ") signatures=" + count);
+                    } catch (Throwable ignored) { }
+                }
+            });
+        }
+    }
+
+    private void hookLiappClass(String name, ClassLoader loader) {
+        if (!LIAPP_HOOKED.add(name)) return;
+        final Class<?> c = XposedHelpers.findClassIfExists(name, loader);
+        if (c == null) return;
+        int n = 0;
+        for (Method m : c.getDeclaredMethods()) {
+            XposedBridge.hookAllMethods(c, m.getName(), new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    StringBuilder sb = new StringBuilder();
+                    for (Object a : p.args) {
+                        sb.append('[').append(a == null ? "null"
+                                : clip(String.valueOf(a))).append(']');
+                    }
+                    XposedBridge.log(TAG + ": liapp " + c.getName() + "."
+                            + p.method.getName() + "(" + sb + ")");
+                }
+
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    if (p.getResult() == null) return;
+                    XposedBridge.log(TAG + ": liapp " + p.method.getName()
+                            + " => " + clip(String.valueOf(p.getResult())));
+                }
+            });
+            n++;
+        }
+        XposedBridge.log(TAG + ": observing " + n + " methods of " + name);
+    }
+
+    private static String clip(String s) {
+        return s.length() > 140 ? s.substring(0, 140) + "..." : s;
     }
 
     // --- TLS pinning ---------------------------------------------------------------
