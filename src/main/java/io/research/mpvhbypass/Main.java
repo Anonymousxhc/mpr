@@ -166,7 +166,7 @@ public final class Main implements IXposedHookLoadPackage {
         }
         XposedBridge.hookAllConstructors(imdc, new XC_MethodHook() {
             @Override protected void beforeHookedMethod(MethodHookParam p) {
-                for (ByteBuffer bb : buffersOf(p.args.length > 0 ? p.args[0] : null)) {
+                for (ByteBuffer bb : buffersOf(p.args)) {
                     saveIfDex(bb, pkg);
                 }
             }
@@ -174,15 +174,31 @@ public final class Main implements IXposedHookLoadPackage {
         log("payload dumper armed");
     }
 
-    private static List<ByteBuffer> buffersOf(Object arg) {
+    // android-35 declares InMemoryDexClassLoader(ByteBuffer[],..) x2 and
+    // InMemoryDexClassLoader(ByteBuffer,..). Scanning every argument for buffers,
+    // arrays and collections instead of assuming position 0 keeps a newer signature
+    // from producing a silent no-dump on a device ahead of the SDK we compile against.
+    private static List<ByteBuffer> buffersOf(Object[] args) {
         List<ByteBuffer> out = new ArrayList<>();
-        if (arg instanceof ByteBuffer) out.add((ByteBuffer) arg);
-        else if (arg != null && arg.getClass().isArray()) {
-            for (Object o : (Object[]) arg) {
-                if (o instanceof ByteBuffer) out.add((ByteBuffer) o);
+        for (Object a : args) collect(a, out, 0);
+        return out;
+    }
+
+    private static void collect(Object arg, List<ByteBuffer> out, int depth) {
+        if (arg == null || depth > 2 || out.size() > 16) return;
+        if (arg instanceof ByteBuffer) {
+            out.add((ByteBuffer) arg);
+            return;
+        }
+        if (arg instanceof java.util.Collection) {
+            for (Object o : (java.util.Collection<?>) arg) collect(o, out, depth + 1);
+            return;
+        }
+        if (arg.getClass().isArray()) {
+            for (int i = 0; i < Array.getLength(arg); i++) {
+                collect(Array.get(arg, i), out, depth + 1);
             }
         }
-        return out;
     }
 
     private static final int MAX_DUMPS = 8;
