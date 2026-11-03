@@ -19,9 +19,20 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
-      - run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      # ubuntu-latest already ships the Android SDK with licenses accepted.
+      # android-actions/setup-android@v3 is deliberately not used: its default package
+      # list still asks for the retired 'tools' package and sdkmanager exits 1.
+      - name: Ensure platform and build-tools
+        run: |
+          set -e
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          if [ ! -d "$ANDROID_HOME/platforms/android-34" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34"
+          fi
+          if [ ! -d "$ANDROID_HOME/build-tools/34.0.0" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0"
+          fi
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
