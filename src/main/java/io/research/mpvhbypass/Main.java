@@ -1,8 +1,11 @@
 package io.research.mpvhbypass;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.lang.reflect.Array;
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
@@ -58,7 +61,8 @@ public final class Main implements IXposedHookLoadPackage {
         installDetectionBypass();
         installUiProbe();
         installExitGate();
-        if (kalam) installDexSpy(lpparam.classLoader);
+        installSensorMuting(lpparam.classLoader);
+        if (kalam) { installDexSpy(lpparam.classLoader); installDexDump(lpparam.packageName); }
         if (mpar) installNativeScannerBypass(lpparam.classLoader);
 
         // Zepto binds its own classes late; re-apply once the real names arrive. This is
@@ -144,6 +148,94 @@ public final class Main implements IXposedHookLoadPackage {
             java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final java.util.Set<String> SEEN_QUERY =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // --- payload recovery --------------------------------------------------------------
+    // The unpacked LIAPP payload is still ciphertext on disk: 350,469 bytes, 7.999
+    // bits/byte across all 256 byte values, and no dex/cdex/zip magic at any offset. It
+    // is therefore decrypted only far enough to hand ART a ByteBuffer, which makes
+    // InMemoryDexClassLoader the one place the plaintext has to exist. Copy each buffer
+    // out on the way in; the loader's arguments are not touched, so the app sees exactly
+    // what it would have seen without us.
+
+    private void installDexDump(String pkg) {
+        Class<?> imdc = XposedHelpers.findClassIfExists(
+                "dalvik.system.InMemoryDexClassLoader", null);
+        if (imdc == null) {
+            log("InMemoryDexClassLoader absent; payload stays in-process only");
+            return;
+        }
+        XposedBridge.hookAllConstructors(imdc, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                for (ByteBuffer bb : buffersOf(p.args.length > 0 ? p.args[0] : null)) {
+                    saveIfDex(bb, pkg);
+                }
+            }
+        });
+        log("payload dumper armed");
+    }
+
+    private static List<ByteBuffer> buffersOf(Object arg) {
+        List<ByteBuffer> out = new ArrayList<>();
+        if (arg instanceof ByteBuffer) out.add((ByteBuffer) arg);
+        else if (arg != null && arg.getClass().isArray()) {
+            for (Object o : (Object[]) arg) {
+                if (o instanceof ByteBuffer) out.add((ByteBuffer) o);
+            }
+        }
+        return out;
+    }
+
+    private static final int MAX_DUMPS = 8;
+    private static final int MAX_DUMP_BYTES = 64 * 1024 * 1024;
+    private static final java.util.Set<String> SEEN_DUMP =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static int dumps;
+
+    private void saveIfDex(ByteBuffer src, String pkg) {
+        if (dumps >= MAX_DUMPS) return;
+        ByteBuffer bb = src.duplicate();
+        bb.position(0);
+        int len = bb.remaining();
+        if (len < 16 || len > MAX_DUMP_BYTES) return;
+        byte[] data = new byte[len];
+        bb.get(data);
+        boolean zip = data[0] == 'P' && data[1] == 'K' && data[2] == 3 && data[3] == 4;
+        boolean dex = (data[0] == 'd' && data[1] == 'e' && data[2] == 'x' && data[3] == '\n')
+                || (data[0] == 'c' && data[1] == 'd' && data[2] == 'e' && data[3] == 'x');
+        if (!dex && !zip) return;
+        if (!SEEN_DUMP.add(len + ":" + java.util.Arrays.hashCode(data))) return;
+        File dir = filesDir(pkg);
+        if (dir == null) {
+            report("nowhere writable for payload dump (" + len + " B)");
+            return;
+        }
+        String name = "recovered-" + (++dumps) + (zip ? ".jar" : ".dex");
+        File out = new File(dir, name);
+        try (FileOutputStream fos = new FileOutputStream(out)) {
+            fos.write(data);
+            report("wrote " + out.getAbsolutePath() + " (" + len + " B)");
+        } catch (Throwable t) {
+            dumps--;
+            report("dump failed for " + len + " B buffer: " + t);
+        }
+    }
+
+    private static File filesDir(String pkg) {
+        try {
+            Object app = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClassIfExists("android.app.ActivityThread", null),
+                    "currentApplication");
+            if (app != null) {
+                Object f = XposedHelpers.callMethod(app, "getFilesDir");
+                if (f instanceof File && ((File) f).isDirectory()) return (File) f;
+            }
+        } catch (Throwable ignored) { }
+        for (String base : new String[]{"/data/user/0/", "/data/data/"}) {
+            File f = new File(base + pkg + "/files");
+            if (f.isDirectory() || f.mkdirs()) return f;
+        }
+        return null;
+    }
 
     // --- TLS pinning ---------------------------------------------------------------
     // No res/xml exists in this APK, so there is no network_security_config pin:
@@ -439,6 +531,71 @@ public final class Main implements IXposedHookLoadPackage {
             }, int.class);
         }
     }
+
+    // --- LIAPP's own sensors --------------------------------------------------------
+    // Named from the decompiled SDK rather than guessed. com.liapp.x ships in the clear
+    // and reads Settings.Global "adb_enabled" (x.java:281), a `getprop` subprocess whose
+    // output it takes with BufferedReader.readLine (x.java:981-985),
+    // Debug.isDebuggerConnected() (x.java:512), and a Class.forName probe assembled from
+    // decrypted fragments (x.java:375). Its trust anchor is com.liapp.g, an
+    // X509TrustManager wrapping X509TrustManagerExtensions that raises "Liapp Pin
+    // verification failed" - and no code outside the okhttp3 library itself ever
+    // constructs a CertificatePinner, so OkHttp's pinner was never this app's pinning
+    // path even though the class is present in the APK.
+
+    private void installSensorMuting(ClassLoader loader) {
+        XC_MethodHook devOff = new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                if (p.args.length < 2 || !(p.args[1] instanceof String)) return;
+                String key = (String) p.args[1];
+                if ("adb_enabled".equals(key) || "development_settings_enabled".equals(key)) {
+                    p.setResult(0);
+                }
+            }
+        };
+        for (String cls : new String[]{"android.provider.Settings$Global",
+                "android.provider.Settings$Secure", "android.provider.Settings$System"}) {
+            Class<?> c = XposedHelpers.findClassIfExists(cls, loader);
+            if (c != null) XposedBridge.hookAllMethods(c, "getInt", devOff);
+        }
+
+        Class<?> debug = XposedHelpers.findClassIfExists("android.os.Debug", loader);
+        if (debug != null) {
+            XC_MethodHook noDebugger = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    p.setResult(Boolean.FALSE);
+                }
+            };
+            XposedBridge.hookAllMethods(debug, "isDebuggerConnected", noDebugger);
+            XposedBridge.hookAllMethods(debug, "waitingForDebugger", noDebugger);
+        }
+
+        Class<?> pinner = XposedHelpers.findClassIfExists("com.liapp.g", loader);
+        if (pinner != null && NEUTRALISED.add("com.liapp.g")) {
+            XposedBridge.hookAllMethods(pinner, "checkServerTrusted", bypass());
+            XposedBridge.hookAllMethods(pinner, "checkClientTrusted", bypass());
+            hook(pinner, "getAcceptedIssuers", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    p.setResult(new X509Certificate[0]);
+                }
+            });
+            log("neutralised com.liapp.g pinning trust manager");
+        }
+
+        XC_MethodHook showCmd = new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                if (p.args.length == 0 || p.args[0] == null) return;
+                String cmd = p.args[0] instanceof String[]
+                        ? join((String[]) p.args[0]) : String.valueOf(p.args[0]);
+                if (SEEN_CMD.add(cmd)) report("exec: " + cmd);
+            }
+        };
+        hook(Runtime.class, "exec", showCmd, String.class);
+        hook(Runtime.class, "exec", showCmd, String[].class);
+    }
+
+    private static final java.util.Set<String> SEEN_CMD =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private XC_MethodHook spy(final int index) {
         return new XC_MethodHook() {
